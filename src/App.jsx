@@ -7,6 +7,10 @@ import {
   moveToTrash,
   restoreTask,
   deletePermanent,
+  createUser,
+  loginUser,
+  fetchCurrentUser,
+  slackLogin,
 } from './api'
 import './App.css'
 
@@ -21,6 +25,28 @@ function App() {
   const [selectedTask, setSelectedTask] = useState(null)
   const [editTitle, setEditTitle] = useState('')
   const [editDesc, setEditDesc] = useState('')
+
+  // ページ切り替え: login / register / main
+  const [page, setPage] = useState('login')
+
+  // 会員登録フォーム
+  const [registerEmail, setRegisterEmail] = useState('')
+  const [registerName, setRegisterName] = useState('')
+  const [registerPassword, setRegisterPassword] = useState('')
+  const [registerPasswordConfirm, setRegisterPasswordConfirm] = useState('')
+  const [registerUserType, setRegisterUserType] = useState('customer')
+  const [registerSubmitting, setRegisterSubmitting] = useState(false)
+  const [registerError, setRegisterError] = useState(null)
+
+  // ログインフォーム
+  const [loginEmail, setLoginEmail] = useState('')
+  const [loginPassword, setLoginPassword] = useState('')
+  const [loginSubmitting, setLoginSubmitting] = useState(false)
+  const [loginError, setLoginError] = useState(null)
+
+  // 認証情報
+  const [authToken, setAuthToken] = useState(() => localStorage.getItem('token') || null)
+  const [currentUser, setCurrentUser] = useState(null)
 
   const loadAll = useCallback(async () => {
     setLoading(true)
@@ -40,8 +66,29 @@ function App() {
   }, [])
 
   useEffect(() => {
-    loadAll()
-  }, [loadAll])
+    if (page === 'main') {
+      loadAll()
+    }
+  }, [loadAll, page])
+
+  // トークンがあれば現在のユーザー情報を取得し、自動ログイン
+  useEffect(() => {
+    const token = authToken || localStorage.getItem('token')
+    if (!token || currentUser) return
+
+    ;(async () => {
+      try {
+        const user = await fetchCurrentUser(token)
+        setCurrentUser(user)
+        setAuthToken(token)
+        setPage('main')
+      } catch (err) {
+        console.error('現在のユーザー取得に失敗しました:', err)
+        localStorage.removeItem('token')
+        setAuthToken(null)
+      }
+    })()
+  }, [authToken, currentUser])
 
   const openPanel = (task, isTrashed) => {
     setSelectedTask({ ...task, isTrashed })
@@ -129,6 +176,281 @@ function App() {
     }
   }
 
+  const handleLogout = () => {
+    localStorage.removeItem('token')
+    setAuthToken(null)
+    setCurrentUser(null)
+    setPage('login')
+  }
+
+  const handleRegisterSubmit = async (e) => {
+    e.preventDefault()
+    setRegisterError(null)
+    if (!registerEmail.trim() || !registerName.trim() || !registerPassword.trim()) {
+      setRegisterError('メールアドレス・名前・パスワードは必須です。')
+      return
+    }
+    if (registerPassword !== registerPasswordConfirm) {
+      setRegisterError('passwordが一致しません')
+      return
+    }
+    setRegisterSubmitting(true)
+    try {
+      await createUser({
+        email: registerEmail.trim(),
+        name: registerName.trim(),
+        password: registerPassword,
+        user_type: registerUserType,
+      })
+      setPage('login')
+      setRegisterEmail('')
+      setRegisterName('')
+      setRegisterPassword('')
+      setRegisterPasswordConfirm('')
+      setRegisterUserType('customer')
+      alert('会員登録が完了しました。ログインしてください。')
+    } catch (err) {
+      const msg = err.message || ''
+      const isDuplicate = /E11000|duplicate|重複/i.test(msg)
+      setRegisterError(isDuplicate ? 'emailが重複しています。もう一度確認してください' : (msg || '会員登録に失敗しました。'))
+    } finally {
+      setRegisterSubmitting(false)
+    }
+  }
+
+  const handleLoginSubmit = async (e) => {
+    e.preventDefault()
+    setLoginError(null)
+    if (!loginEmail.trim() || !loginPassword.trim()) {
+      setLoginError('メールアドレスとパスワードは必須です。')
+      return
+    }
+    setLoginSubmitting(true)
+    try {
+      const result = await loginUser(loginEmail.trim(), loginPassword)
+      if (result.token) {
+        localStorage.setItem('token', result.token)
+        setAuthToken(result.token)
+      }
+      setCurrentUser(result.user || null)
+      setPage('main')
+      setLoginPassword('')
+      setLoginEmail('')
+    } catch (err) {
+      const msg = err.message || ''
+      const isPasswordMismatch = /passwordが一致しません|401|認証|credentials/i.test(msg)
+      setLoginError(isPasswordMismatch ? 'passwordが一致しません' : (msg || 'ログインに失敗しました。'))
+    } finally {
+      setLoginSubmitting(false)
+    }
+  }
+
+  // Slack OAuth URL を生成（ボタン・案内リンクで共通利用）
+  const getSlackAuthUrl = () => {
+    const clientId = import.meta.env.VITE_SLACK_CLIENT_ID
+    const redirectUri = import.meta.env.VITE_SLACK_REDIRECT_URI
+    if (!clientId || !redirectUri) return null
+    const state = 'slack'
+    return `https://slack.com/openid/connect/authorize?client_id=${encodeURIComponent(
+      clientId,
+    )}&scope=openid,profile,email&redirect_uri=${encodeURIComponent(
+      redirectUri,
+    )}&state=${encodeURIComponent(state)}`
+  }
+
+  const handleSlackLogin = () => {
+    const url = getSlackAuthUrl()
+    if (!url) {
+      alert('Slack ログインの設定が不足しています。VITE_SLACK_CLIENT_ID と VITE_SLACK_REDIRECT_URI を確認してください。')
+      return
+    }
+    const opened = window.open(url, '_blank', 'noopener,noreferrer')
+    if (!opened) window.location.href = url
+  }
+
+  // Slack OAuth コールバック処理（code パラメータがある場合）
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const code = params.get('code')
+    const state = params.get('state')
+    if (!code || state !== 'slack' || authToken || currentUser) return
+
+    ;(async () => {
+      try {
+        setLoginSubmitting(true)
+        const result = await slackLogin(code)
+        if (result.token) {
+          localStorage.setItem('token', result.token)
+          setAuthToken(result.token)
+        }
+        setCurrentUser(result.user || null)
+        setPage('main')
+        window.history.replaceState(null, '', window.location.pathname)
+      } catch (err) {
+        console.error('Slack ログインに失敗しました:', err)
+        setLoginError('Slack ログインに失敗しました。')
+      } finally {
+        setLoginSubmitting(false)
+      }
+    })()
+  }, [authToken, currentUser])
+
+  // ログインページ
+  if (page === 'login') {
+    return (
+      <div className="register-page">
+        <header className="register-header">
+          <div className="register-logo">My Todos</div>
+          <p className="register-header-link">
+            アカウントをお持ちでないですか？{' '}
+            <button type="button" className="register-link-btn" onClick={() => setPage('register')}>
+              会員登録
+            </button>
+          </p>
+        </header>
+        <div className="register-content">
+          <h1 className="register-title">サインインするにはメールアドレスを入力してください</h1>
+          <p className="register-subtitle">または、別の方法を選択してサインインしてください。</p>
+
+          <form className="register-form" onSubmit={handleLoginSubmit}>
+            <input
+              type="email"
+              className="register-input"
+              placeholder="名前@work-email.com"
+              value={loginEmail}
+              onChange={(e) => setLoginEmail(e.target.value)}
+              autoComplete="email"
+            />
+            <input
+              type="password"
+              className="register-input"
+              placeholder="パスワード"
+              value={loginPassword}
+              onChange={(e) => setLoginPassword(e.target.value)}
+              autoComplete="current-password"
+            />
+            {loginError && <p className="register-error">{loginError}</p>}
+            <button type="submit" className="register-btn-primary" disabled={loginSubmitting}>
+              {loginSubmitting ? 'サインイン中...' : 'メールアドレスでサインインする'}
+            </button>
+          </form>
+
+          <p className="register-divider">または次の方法でサインインする：</p>
+          <div className="register-social">
+            <button type="button" className="register-social-btn" onClick={handleSlackLogin}>
+              Slack
+            </button>
+          </div>
+          <div className="register-slack-fallback">
+            <p className="register-slack-fallback-title">Slack で「このブラウザはサポートされていません」と出る場合</p>
+            <ol className="register-slack-fallback-steps">
+              <li>Chrome または Edge（最新版）を起動します。</li>
+              <li>
+                次のアドレスをコピーして、そのブラウザのアドレスバーに貼り付け、このアプリを開き直します：
+                <br />
+                <code className="register-slack-fallback-url">{window.location.origin}{window.location.pathname}</code>
+              </li>
+              <li>表示されたログイン画面で「Slack」をクリックします。</li>
+            </ol>
+            <p className="register-slack-fallback-link-desc">または、下のリンクを右クリック→「リンクのアドレスをコピー」し、Chrome または Edge のアドレスバーに貼り付けて開いてください。</p>
+            {getSlackAuthUrl() && (
+              <a
+                href={getSlackAuthUrl()}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="register-slack-fallback-link"
+              >
+                Slack 認証ページを開く（Chrome/Edge で開いてください）
+              </a>
+            )}
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // 会員登録ページ
+  if (page === 'register') {
+    return (
+      <div className="register-page">
+        <header className="register-header">
+          <div className="register-logo">My Todos</div>
+          <p className="register-header-link">
+            すでにアカウントをお持ちですか？{' '}
+            <button type="button" className="register-link-btn" onClick={() => setPage('login')}>
+              サインイン
+            </button>
+          </p>
+        </header>
+        <div className="register-content">
+          <h1 className="register-title">会員登録するにはメールアドレスなどを入力してください</h1>
+          <p className="register-subtitle">または、別の方法を選択して登録してください。</p>
+
+          <form className="register-form" onSubmit={handleRegisterSubmit}>
+            <input
+              type="email"
+              className="register-input"
+              placeholder="名前@work-email.com"
+              value={registerEmail}
+              onChange={(e) => setRegisterEmail(e.target.value)}
+              autoComplete="email"
+            />
+            <input
+              type="text"
+              className="register-input"
+              placeholder="名前"
+              value={registerName}
+              onChange={(e) => setRegisterName(e.target.value)}
+              autoComplete="name"
+            />
+            <input
+              type="password"
+              className="register-input"
+              placeholder="パスワード"
+              value={registerPassword}
+              onChange={(e) => setRegisterPassword(e.target.value)}
+              autoComplete="new-password"
+            />
+            <input
+              type="password"
+              className="register-input"
+              placeholder="パスワード（確認）"
+              value={registerPasswordConfirm}
+              onChange={(e) => setRegisterPasswordConfirm(e.target.value)}
+              autoComplete="new-password"
+            />
+            <label className="register-label">
+              会員タイプ
+              <select
+                className="register-select"
+                value={registerUserType}
+                onChange={(e) => setRegisterUserType(e.target.value)}
+              >
+                <option value="customer">customer（一般会員）</option>
+                <option value="admin">admin（管理者）</option>
+              </select>
+            </label>
+            {registerError && <p className="register-error">{registerError}</p>}
+            <button type="submit" className="register-btn-primary" disabled={registerSubmitting}>
+              {registerSubmitting ? '登録中...' : '会員登録する'}
+            </button>
+          </form>
+
+          <p className="register-divider">または次の方法で登録する：</p>
+          <div className="register-social">
+            <button type="button" className="register-social-btn" disabled>
+              Google
+            </button>
+            <button type="button" className="register-social-btn" disabled>
+              Apple
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // メイン（タスク管理）ページ
   return (
     <>
       <div className="sidebar-overlay" data-active={sidebarOpen} onClick={() => setSidebarOpen(false)} aria-hidden="true" />
@@ -157,11 +479,20 @@ function App() {
             <input type="search" placeholder="Search" className="search-input" />
           </div>
           <div className="header-right">
+            <button type="button" className="btn-register" onClick={() => setPage('register')}>
+              会員加入
+            </button>
             <div className="user-profile">
-              <span className="user-name">User</span>
-              <span className="dropdown-icon">▼</span>
+              <span className="user-name">
+                {currentUser?.name ? `${currentUser.name}様、こんにちは！` : 'ゲスト様、こんにちは！'}
+              </span>
+              {currentUser && (
+                <button type="button" className="btn-register user-logout-button" onClick={handleLogout}>
+                  ログアウト
+                </button>
+              )}
             </div>
-            <div className="user-avatar">U</div>
+            <div className="user-avatar">{(currentUser?.name || 'G').charAt(0).toUpperCase()}</div>
             <div className="filter-select"><span className="filter-text">This week</span><span className="dropdown-icon">▼</span></div>
           </div>
         </header>
